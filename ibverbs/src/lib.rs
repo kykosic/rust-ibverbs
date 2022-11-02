@@ -1077,7 +1077,7 @@ impl<T> Drop for MemoryRegion<T> {
 /// A memory region that has been registered for use with RDMA.
 pub struct BorrowedMemoryRegion<'a, T> {
     mr: *mut ffi::ibv_mr,
-    data: &'a mut Vec<T>,
+    data: &'a mut [T],
 }
 
 unsafe impl<'a, T> Send for BorrowedMemoryRegion<'a, T> {}
@@ -1220,7 +1220,7 @@ impl<'ctx> ProtectionDomain<'ctx> {
     }
 
     /// Hi im docs
-    pub fn register<'a, T>(&self, data: &'a mut Vec<T>) -> io::Result<BorrowedMemoryRegion<'a, T>> {
+    pub fn register<'a, T>(&self, data: &'a mut [T]) -> io::Result<BorrowedMemoryRegion<'a, T>> {
 
         let access = ffi::ibv_access_flags::IBV_ACCESS_LOCAL_WRITE
             | ffi::ibv_access_flags::IBV_ACCESS_REMOTE_WRITE
