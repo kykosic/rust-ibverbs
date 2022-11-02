@@ -1073,6 +1073,46 @@ impl<T> Drop for MemoryRegion<T> {
     }
 }
 
+
+/// A memory region that has been registered for use with RDMA.
+pub struct BorrowedMemoryRegion<'a, T> {
+    mr: *mut ffi::ibv_mr,
+    data: &'a mut Vec<T>,
+}
+
+unsafe impl<'a, T> Send for BorrowedMemoryRegion<'a, T> {}
+unsafe impl<'a, T> Sync for BorrowedMemoryRegion<'a, T> {}
+
+impl<'a, T> Deref for BorrowedMemoryRegion<'a, T> {
+    type Target = [T];
+    fn deref(&self) -> &Self::Target {
+        &self.data[..]
+    }
+}
+
+impl<'a, T> DerefMut for BorrowedMemoryRegion<'a, T> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.data[..]
+    }
+}
+
+impl<'a, T> BorrowedMemoryRegion<'a, T> {
+    /// Get the remote authentication key used to allow direct remote access to this memory region.
+    pub fn rkey(&self) -> RemoteKey {
+        RemoteKey(unsafe { &*self.mr }.rkey)
+    }
+}
+
+impl<'a, T> Drop for BorrowedMemoryRegion<'a, T> {
+    fn drop(&mut self) {
+        let errno = unsafe { ffi::ibv_dereg_mr(self.mr) };
+        if errno != 0 {
+            let e = io::Error::from_raw_os_error(errno);
+            panic!("{}", e);
+        }
+    }
+}
+
 /// A protection domain for a device's context.
 pub struct ProtectionDomain<'ctx> {
     ctx: &'ctx Context,
@@ -1177,6 +1217,38 @@ impl<'ctx> ProtectionDomain<'ctx> {
         } else {
             Ok(MemoryRegion { mr, data })
         }
+    }
+
+    /// Hi im docs
+    pub fn register<'a, T>(&self, data: &'a mut Vec<T>) -> io::Result<BorrowedMemoryRegion<'a, T>> {
+
+        let access = ffi::ibv_access_flags::IBV_ACCESS_LOCAL_WRITE
+            | ffi::ibv_access_flags::IBV_ACCESS_REMOTE_WRITE
+            | ffi::ibv_access_flags::IBV_ACCESS_REMOTE_READ
+            | ffi::ibv_access_flags::IBV_ACCESS_REMOTE_ATOMIC;
+        let mr = unsafe {
+            ffi::ibv_reg_mr(
+                self.pd,
+                data.as_mut_ptr() as *mut _,
+                data.len() * mem::size_of::<T>(),
+                access.0 as i32,
+            )
+        };
+
+        // TODO
+        // ibv_reg_mr()  returns  a  pointer to the registered MR, or NULL if the request fails.
+        // The local key (L_Key) field lkey is used as the lkey field of struct ibv_sge when
+        // posting buffers with ibv_post_* verbs, and the the remote key (R_Key)  field rkey  is
+        // used by remote processes to perform Atomic and RDMA operations.  The remote process
+        // places this rkey as the rkey field of struct ibv_send_wr passed to the ibv_post_send
+        // function.
+
+        if mr.is_null() {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(BorrowedMemoryRegion { mr, data })
+        }
+
     }
 }
 
@@ -1291,6 +1363,62 @@ impl<'res> QueuePair<'res> {
         }
     }
 
+    /// hi doc here
+    #[inline]
+    pub unsafe fn post_send_b<'a, T, R>(
+        &mut self,
+        mr: &mut BorrowedMemoryRegion<'a, T>,
+        range: R,
+        wr_id: u64,
+    ) -> io::Result<()>
+    where
+        R: sliceindex::SliceIndex<[T], Output = [T]>,
+    {
+        let range = range.index(mr);
+        let mut sge = ffi::ibv_sge {
+            addr: range.as_ptr() as u64,
+            length: (mem::size_of::<T>() * range.len()) as u32,
+            lkey: (&*mr.mr).lkey,
+        };
+        let mut wr = ffi::ibv_send_wr {
+            wr_id: wr_id,
+            next: ptr::null::<ffi::ibv_send_wr>() as *mut _,
+            sg_list: &mut sge as *mut _,
+            num_sge: 1,
+            opcode: ffi::ibv_wr_opcode::IBV_WR_SEND,
+            send_flags: ffi::ibv_send_flags::IBV_SEND_SIGNALED.0,
+            wr: Default::default(),
+            qp_type: Default::default(),
+            __bindgen_anon_1: Default::default(),
+            __bindgen_anon_2: Default::default(),
+        };
+        let mut bad_wr: *mut ffi::ibv_send_wr = ptr::null::<ffi::ibv_send_wr>() as *mut _;
+
+        // TODO:
+        //
+        // ibv_post_send()  posts the linked list of work requests (WRs) starting with wr to the
+        // send queue of the queue pair qp.  It stops processing WRs from this list at the first
+        // failure (that can  be  detected  immediately  while  requests  are  being posted), and
+        // returns this failing WR through bad_wr.
+        //
+        // The user should not alter or destroy AHs associated with WRs until request is fully
+        // executed and  a  work  completion  has been retrieved from the corresponding completion
+        // queue (CQ) to avoid unexpected behavior.
+        //
+        // ... However, if the IBV_SEND_INLINE flag was set, the  buffer  can  be reused
+        // immediately after the call returns.
+
+        let ctx = (&*self.qp).context;
+        let ops = &mut (&mut *ctx).ops;
+        let errno =
+            ops.post_send.as_mut().unwrap()(self.qp, &mut wr as *mut _, &mut bad_wr as *mut _);
+        if errno != 0 {
+            Err(io::Error::from_raw_os_error(errno))
+        } else {
+            Ok(())
+        }
+    }
+
     /// Posts a linked list of Work Requests (WRs) to the Receive Queue of this Queue Pair.
     ///
     /// Generates a HW-specific Receive Request out of it and add it to the tail of the Queue
@@ -1324,6 +1452,54 @@ impl<'res> QueuePair<'res> {
     pub unsafe fn post_receive<T, R>(
         &mut self,
         mr: &mut MemoryRegion<T>,
+        range: R,
+        wr_id: u64,
+    ) -> io::Result<()>
+    where
+        R: sliceindex::SliceIndex<[T], Output = [T]>,
+    {
+        let range = range.index(mr);
+        let mut sge = ffi::ibv_sge {
+            addr: range.as_ptr() as u64,
+            length: (mem::size_of::<T>() * range.len()) as u32,
+            lkey: (&*mr.mr).lkey,
+        };
+        let mut wr = ffi::ibv_recv_wr {
+            wr_id: wr_id,
+            next: ptr::null::<ffi::ibv_send_wr>() as *mut _,
+            sg_list: &mut sge as *mut _,
+            num_sge: 1,
+        };
+        let mut bad_wr: *mut ffi::ibv_recv_wr = ptr::null::<ffi::ibv_recv_wr>() as *mut _;
+
+        // TODO:
+        //
+        // If the QP qp is associated with a shared receive queue, you must use the function
+        // ibv_post_srq_recv(), and not ibv_post_recv(), since the QP's own receive queue will not
+        // be used.
+        //
+        // If a WR is being posted to a UD QP, the Global Routing Header (GRH) of the incoming
+        // message will be placed in the first 40 bytes of the buffer(s) in the scatter list. If no
+        // GRH is present in the incoming message, then the first  bytes  will  be undefined. This
+        // means that in all cases, the actual data of the incoming message will start at an offset
+        // of 40 bytes into the buffer(s) in the scatter list.
+
+        let ctx = (&*self.qp).context;
+        let ops = &mut (&mut *ctx).ops;
+        let errno =
+            ops.post_recv.as_mut().unwrap()(self.qp, &mut wr as *mut _, &mut bad_wr as *mut _);
+        if errno != 0 {
+            Err(io::Error::from_raw_os_error(errno))
+        } else {
+            Ok(())
+        }
+    }
+
+    /// hi docs
+    #[inline]
+    pub unsafe fn post_receive_b<'a, T, R>(
+        &mut self,
+        mr: &mut BorrowedMemoryRegion<'a, T>,
         range: R,
         wr_id: u64,
     ) -> io::Result<()>
